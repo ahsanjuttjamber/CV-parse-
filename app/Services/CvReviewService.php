@@ -13,87 +13,134 @@ class CvReviewService
         // 1️⃣ PDF → TEXT
         $parser = new Parser();
         $pdf = $parser->parseFile($filePath);
+
         $text = trim($pdf->getText());
         $text = mb_convert_encoding($text, 'UTF-8', 'UTF-8');
         $text = mb_substr($text, 0, 6000);
 
-        // 2️⃣ OpenAI REVIEW
-        $response = Http::withToken(config('services.openai.key'))
-            ->timeout(60)
-            ->post('https://api.openai.com/v1/chat/completions', [
-                'model' => 'gpt-4o-mini',
-                'messages' => [
-                    [
-                        'role' => 'system',
-                        'content' => 'You are a professional HR CV reviewer. Respond ONLY in valid JSON.'
-                    ],
-                    [
-                        'role' => 'user',
-                        'content' => "
-Analyze this CV and return JSON in EXACT format:
+        // 2️⃣ OpenRouter Config
+        $baseUrl = config('openrouter.base_url');
+        $apiKey  = config('openrouter.api_key');
+        $model   = config('openrouter.default_model');
+
+        try {
+            $response = Http::withToken($apiKey)
+                ->timeout(60)
+                ->post($baseUrl . '/chat/completions', [
+
+                    'model' => $model,
+
+                    'messages' => [
+
+                        [
+                            'role' => 'system',
+                            'content' =>
+                                "You are a professional HR CV reviewer.
+Return ONLY raw JSON.
+Do NOT use markdown.
+Do NOT wrap inside ```json.
+Candidate_email and internal_email MUST be plain strings."
+                        ],
+
+                        [
+                            'role' => 'user',
+                            'content' => <<<PROMPT
+Return JSON ONLY in this format:
 
 {
-  \"issues\": [],
-  \"missing_sections\": [],
-  \"candidate_email\": \"\",
-  \"internal_email\": \"\"
+  "title": "CV Review",
+  "system": [
+    "Analyzes the CV",
+    "Displays detected issues",
+    "Shows two generated email contents:",
+    "1. Candidate feedback email",
+    "2. Internal improvement email"
+  ],
+  "message": "CV reviewed successfully",
+  "review_id": 7,
+  "data": {
+    "issues": [],
+    "missing_sections": [],
+    "candidate_email": "",
+    "internal_email": ""
+  }
 }
 
-Check for missing or weak sections:
-- Title / Role
-- Email
-- Phone Number
-- About Me
-- Cover Letter
-- Education
-- Experience
-- Skills
-- Certifications
-- Awards
-
 Rules:
-- issues: list of problems found
-- missing_sections: sections not present or very weak
-- candidate_email: 5–6 lines polite feedback email
-- internal_email: 5–6 lines improvement suggestions for HR/admin
+- issues must be simple strings (not objects)
+- candidate_email must be 5–6 line string
+- internal_email must be 5–6 line string
 
 CV TEXT:
 {$text}
-"
-                    ]
-                ],
-                'temperature' => 0.2,
-                'max_tokens' => 900
-            ]);
+PROMPT
+                        ]
+                    ],
+
+                    'temperature' => 0.2,
+                    'max_tokens' => 900
+                ]);
+
+        } catch (\Throwable $e) {
+            return ['error' => 'OpenRouter request failed: ' . $e->getMessage()];
+        }
 
         if (!$response->successful()) {
-            return ['error' => 'OpenAI request failed'];
+            return ['error' => 'OpenRouter failed', 'status' => $response->status()];
         }
 
         $content = $response->json('choices.0.message.content');
 
         if (!$content) {
-            return ['error' => 'Empty AI response'];
+            return ['error' => 'Empty response from OpenRouter'];
         }
 
-        $data = json_decode($content, true);
+        // ✅ Remove Markdown Wrapper
+        $content = preg_replace('/```json|```/', '', $content);
+        $content = trim($content);
 
-        if (!$data) {
-            return ['error' => 'Invalid JSON from AI'];
+        // ✅ Decode JSON safely
+        try {
+            $data = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\Throwable $e) {
+            return [
+                'error' => 'Invalid JSON from OpenRouter',
+                'raw' => $content
+            ];
         }
 
-        // 3️⃣ STORE IN DB
+        // ✅ Force emails into strings
+        if (is_array($data['candidate_email'] ?? null)) {
+            $data['candidate_email'] = implode("\n", $data['candidate_email']['body'] ?? []);
+        }
+
+        if (is_array($data['internal_email'] ?? null)) {
+            $data['internal_email'] = implode("\n", $data['internal_email']['body'] ?? []);
+        }
+
+        // 3️⃣ Store in DB
         $review = CvReview::create([
-            'file_name'       => $filename,
-            'file_path'       => $filePath,
-            'issues'          => $data['issues'] ?? [],
-            'candidate_email' => $data['candidate_email'] ?? '',
-            'internal_email'  => $data['internal_email'] ?? '',
+            'file_name'        => $filename,
+            'file_path'        => $filePath,
+            'issues'           => $data['issues'] ?? [],
+            'missing_sections' => $data['missing_sections'] ?? [],
+            'candidate_email'  => $data['candidate_email'] ?? '',
+            'internal_email'   => $data['internal_email'] ?? '',
         ]);
 
         return [
+            'title' => 'CV Review',
+            'system' => [
+                'Analyzes the CV',
+                'Displays detected issues',
+                'Shows two generated email contents:',
+                '1. Candidate feedback email',
+                '2. Internal improvement email'
+            ],
+
             'message'   => 'CV reviewed successfully',
             'review_id' => $review->id,
+
             'data'      => $data
         ];
     }
